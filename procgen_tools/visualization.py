@@ -81,9 +81,13 @@ def is_internal_activation(label: str):
 
 
 def plot_layer_stats(
-    hook: cmh.ModuleHook, mode: str = "activations", fig: go.Figure = None
+    manager: cmh.HookManager,
+    mode: str = "activations",
+    fig: go.Figure = None
 ):
-    """Create and show a plotly bar chart of the number of activations per layer of policy. The default mode is "activations", which plots the number of activations per layer. If mode is "parameters", then the number of parameters per layer is plotted."""
+    """Create and show a plotly bar chart of the number of activations per layer of policy.
+    The default mode is "activations", which plots the number of activations per layer.
+    If mode is "parameters", then the number of parameters per layer is plotted."""
     if mode not in ("activations", "parameters"):
         raise ValueError(
             f"mode must be either 'activations' or 'parameters', got {mode}."
@@ -91,29 +95,23 @@ def plot_layer_stats(
 
     # Get the number of activations/parameters per layer
     quantities = {}
-    zipped_list = (
-        filter(
-            lambda tup: is_internal_activation(tup[0]),
-            hook.values_by_label.items(),
-        )
-        if mode == "activations"
-        else hook.network.named_parameters()
-    )
-    for name, quantity in zipped_list:
-        quantities[format_label(name)] = quantity.numel()
+    for name, module in manager.model.named_modules():
+        if mode == "activations":
+            if name in manager.cache:
+                quantities[name] = module.output.numel()
+        elif mode == "parameters":
+            quantities[name] = sum(p.numel() for p in module.parameters())
+
     total_quantity = sum(quantities.values())
 
-    # Aggregate bias quantities
+    # Aggregate bias quantities if mode is "parameters"
     if mode == "parameters":
         bias_quants = {
-            label: quantity
-            for label, quantity in quantities.items()
-            if "bias" in label
+            label: quantity for label, quantity in quantities.items() if "bias" in label
         }
         for label, quantity in bias_quants.items():
-            if (
-                "bias" in label
-            ):  # If the label is a bias, add the quantity to the corresponding weight
+            if "bias" in label:
+                # If the label is a bias, add the quantity to the corresponding weight
                 quantities[label.replace("bias", "weight")] += quantity
                 del quantities[label]
 
@@ -136,6 +134,7 @@ def plot_layer_stats(
     )
 
     formatted_total = format(total_quantity, ",")
+
     # Set layout
     fig.update_layout(
         title={
@@ -167,6 +166,7 @@ def plot_layer_stats(
     fig.update_xaxes(type="log")
 
     fig.show()
+    return fig
 
 
 # Navigating the feature maps
@@ -725,13 +725,19 @@ def custom_vfields(policy: t.nn.Module, venv: ProcgenGym3Env, **kwargs):
     )
 
 
-### activation management
-def get_activations(obs: np.ndarray, hook: cmh.ModuleHook, layer_name: str):
-    hook.run_with_input(obs)  # run the model with the given obs
-    return hook.get_value_by_label(
-        layer_name
-    )  # shape is (b, c, h, w) at conv layers, (b, activations) at linear layers
+def get_activations(obs: np.ndarray, manager: cmh.HookManager, layer_name: str):
+    """Get activations of a specific layer given an observation."""
+    # Convert the observation to a tensor
+    obs_tensor = t.tensor(obs, dtype=t.float32).unsqueeze(0)
 
+    # Run the model with the given observation and collect activations
+    with manager as cache_results:
+        _ = manager.model(obs_tensor)
+
+    # Get the activations of the specified layer
+    activations = cache_results[layer_name]
+
+    return activations.detach().numpy()
 
 ### Plotters
 def plot_activations(activations: np.ndarray, fig: go.FigureWidget):
@@ -802,10 +808,9 @@ def format_plotter(
 
 # To indicate that fig can be matplotlib or plotly, we use the type go.FigureWidget
 
-
 def plot_patch(
     patch: dict,
-    hook: cmh.ModuleHook,
+    manager: cmh.HookManager,
     layer: str = default_layer,
     channel: int = 0,
     fig: go.FigureWidget = None,
@@ -813,21 +818,24 @@ def plot_patch(
     bounds: Tuple[int, int] = None,
     px_dims: Tuple[int, int] = None,
 ):
-    """Plot the activations of a single patch, at the given layer and channel. Returns a figure."""
+    """Plot the activations of a single patch, at the given layer and channel.
+    Returns a figure."""
     assert layer in patch, f"Layer {layer} not in patch {patch}"
-
     if fig is None:
         fig = go.FigureWidget()
-    activations = patch[layer](hook.values_by_label[default_layer])
+
+    # Get the activations of the specified layer
+    activations = patch[layer](manager.cache_results[layer])
+
     assert (
         activations.shape[1] > channel
     ), f"Channel {channel} not in activations {activations.shape}"
 
     activations = activations[0, channel]  # Shape is (h, w)
+
     plot_activations(activations, fig)
-    format_plotter(
-        fig, activations, title=title, bounds=bounds, px_dims=px_dims
-    )
+    format_plotter(fig, activations, title=title, bounds=bounds, px_dims=px_dims)
+
     return fig
 
 
@@ -1171,6 +1179,7 @@ def get_arrows_and_probs(
     action_arrows, probs = [], []
     for i in range(len(legal_mouse_positions)):
         # Dict of action -> probability for this mouse position
+        print(f"{c_probs=}")
         probs_dict = models.human_readable_actions(c_probs[i])
         # Convert to floats
         probs_dict = {k: v.item() for k, v in probs_dict.items()}
@@ -1189,7 +1198,8 @@ def get_arrows_and_probs(
 
 
 def vector_field_tup(
-    venv_all: ProcgenGym3Env,
+        c,
+    venv_all,
     legal_mouse_positions: List[Tuple[int, int]],
     grid: np.ndarray,
     policy: nn.Module,
@@ -1206,16 +1216,22 @@ def vector_field_tup(
     # TODO: Hypothetically, this step could run in parallel to the others (cpu vs. gpu)
     batched_obs = torch.tensor(
         venv_all.reset(), dtype=torch.float32, device=_device(policy)
-    )
+    ).permute(0,3,2,1)
     del venv_all
 
     # use stacked obs list as a tensor
     with torch.no_grad():
+        print(f"{batched_obs.shape=}")
+        print(batched_obs.permute(0,3,2,1).shape)
+        
         categorical, _ = policy(batched_obs)
+        print(f"{categorical}")
 
+    print(categorical.probs, len(legal_mouse_positions))
     action_arrows, probs = get_arrows_and_probs(
-        legal_mouse_positions, categorical.probs
+        legal_mouse_positions, c.probs
     )
+    print(probs)
 
     # make vfield object for returning
     return {

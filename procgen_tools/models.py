@@ -157,25 +157,25 @@ class InterpretableImpalaModel(nn.Module):
 
 class CategoricalPolicy(nn.Module):
     """
-    Copied from train-procgen-pytorch, removed recurrent option as we're not using it.
+    Categorical policy without an embedder.
     """
-    def __init__(self, embedder, action_size):
+    def __init__(self, input_dim, action_size):
         """
-        embedder: (torch.Tensor) model to extract the embedding for observation
+        input_dim: dimension of the input features
         action_size: number of the categorical actions
         """
         super(CategoricalPolicy, self).__init__()
-        self.embedder = embedder
-        # small scale weight-initialization in policy enhances the stability        
-        self.fc_policy = orthogonal_init(nn.Linear(self.embedder.output_dim, action_size), gain=0.01)
-        self.fc_value = orthogonal_init(nn.Linear(self.embedder.output_dim, 1), gain=1.0)
-
+        self.input_dim = input_dim
+        
+        # Small scale weight-initialization in policy enhances the stability
+        self.fc_policy = orthogonal_init(nn.Linear(input_dim, action_size), gain=0.01)
+        self.fc_value = orthogonal_init(nn.Linear(input_dim, 1), gain=1.0)
+    
     def forward(self, x):
-        hidden = self.embedder(x)
-        logits = self.fc_policy(hidden)
+        logits = self.fc_policy(x)
         log_probs = F.log_softmax(logits, dim=1)
         p = Categorical(logits=log_probs)
-        v = self.fc_value(hidden).reshape(-1)
+        v = self.fc_value(x).reshape(-1)
         return p, v
 
 
@@ -227,19 +227,36 @@ def human_readable_actions(probs: np.ndarray) -> dict:
 
     return {act_name: probs[..., np.array(act_indexes)].sum(-1) for act_name, act_indexes in MAZE_ACTION_INDICES.items()}
 
+import gym
+import sys
+sys.path.append('../') #This is added so we can import from the source folder
+from src.policies_impala import ImpalaCNN
 
 def load_policy(model_file: str, action_size: int, device = None) -> CategoricalPolicy:
     assert type(action_size) == int
 
-    checkpoint = torch.load(model_file, map_location=device)
+    # def load_model(ImpalaCNN = ImpalaCNN, model_path ="../model_1400_latest.pt"):
+    env_name = "procgen:procgen-heist-v0"  
+    env = gym.make(env_name, start_level=100, num_levels=200, render_mode="rgb_array", distribution_mode="easy") 
+    observation_space = env.observation_space
+    action_space = env.action_space.n
+    model = ImpalaCNN(observation_space, action_space)
+    model.load_from_file(model_file, device="cpu")
+    
+
+    # checkpoint.state_dict()['conv_seqs.1.res_block0.conv0.weight']
 
     # CURSED. scale varies between models trained on the lauro vs. master branch. 
     global scale
-    scale = checkpoint['model_state_dict']['embedder.block1.conv.weight'].shape[0]//16
 
-    model = InterpretableImpalaModel(in_channels=3)
-    policy = CategoricalPolicy(model, action_size=action_size)
-    policy.load_state_dict(checkpoint['model_state_dict'])
+    scale = model.state_dict()['conv_seqs.1.res_block0.conv0.weight'].shape[0]//16
+
+    # model = InterpretableImpalaModel(in_channels=3)
+    
+    impala_output_dim = 15  # Output dimension based on the provided torch.Size([1, 15])
+    
+    policy = CategoricalPolicy(input_dim=impala_output_dim, action_size=action_size)
+    policy.load_state_dict(model.state_dict(), strict=False)
     return policy
 
 
